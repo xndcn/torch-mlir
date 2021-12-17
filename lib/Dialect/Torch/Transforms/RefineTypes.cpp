@@ -293,7 +293,7 @@ public:
           ValueKnowledge::getNotNonePessimisticValueState(op->getContext());
       if (input.hasSizes) {
         knowledge.hasSizes = true;
-        knowledge.sizes.resize(input.sizes.size(), kUnknownSize);
+        knowledge.sizes.resize(2, kUnknownSize);
       }
       knowledge.dtype = input.dtype;
       return getLatticeElement(op->getResult(0)).join(knowledge);

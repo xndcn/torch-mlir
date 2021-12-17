@@ -3985,6 +3985,79 @@ public:
 };
 } // namespace
 
+namespace {
+class ConvertAtenIndexTensorOp : public OpConversionPattern<AtenIndexTensorOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenIndexTensorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    Location loc = op.getLoc();
+    Value input = adaptor.self();
+    Value indices = op.indices();
+    SmallVector<Value> indicesTuple;
+    if (!getListConstructElements(indices, indicesTuple)) {
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: the indices are not present.");
+    }
+
+    SmallVector<Value> indicesVal =
+        getTypeConvertedValues(rewriter, loc, getTypeConverter(), indicesTuple);
+
+    RankedTensorType inputType = input.getType().cast<RankedTensorType>();
+    RankedTensorType resultType = getTypeConverter()
+                                      ->convertType(op->getResult(0).getType())
+                                      .cast<RankedTensorType>();
+    Type elementType = resultType.getElementType();
+    unsigned inputRank = inputType.getRank();
+    unsigned numIndexTensors = indicesTuple.size();
+    SmallVector<Value> inputShape = getTensorSizes(rewriter, loc, input);
+
+    // Case 1 : When numIndexTensors == 1
+    // TODO: generalize the implementation for other cases.
+    if (numIndexTensors == 1 && inputRank == 1) {
+      unsigned resultRank =
+          indicesVal[0].getType().cast<RankedTensorType>().getRank();
+      SmallVector<Value> resultShape;
+      SmallVector<AffineExpr> indicesExpr, resultExpr;
+      SmallVector<StringRef> iteratorTypes;
+      for (unsigned i = 0; i < resultRank; i++)
+        resultShape.push_back(getDimOp(rewriter, loc, indicesVal[0], i));
+      Value initTensor =
+          rewriter.create<linalg::InitTensorOp>(loc, resultShape, elementType);
+      for (unsigned i = 0; i < resultRank; i++) {
+        indicesExpr.push_back(rewriter.getAffineDimExpr(i));
+        resultExpr.push_back(rewriter.getAffineDimExpr(i));
+        iteratorTypes.push_back(getParallelIteratorTypeName());
+      }
+      auto indexingMaps =
+          AffineMap::inferFromExprList({indicesExpr, resultExpr});
+
+      Value finalRes =
+          rewriter
+              .create<linalg::GenericOp>(
+                  loc, initTensor.getType(), ValueRange{indicesVal[0]},
+                  initTensor,
+                  /*indexingMaps=*/indexingMaps,
+                  /*iteratorTypes=*/iteratorTypes,
+                  [&](OpBuilder &b, Location loc, ValueRange args) {
+                    Value indexTarget = castIntToIndex(b, loc, args[0]);
+                    Value extractedElement =
+                        b.create<tensor::ExtractOp>(loc, input, indexTarget);
+                    b.create<linalg::YieldOp>(loc, extractedElement);
+                  })
+              .getResult(0);
+
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, finalRes);
+    }
+    return success();
+  }
+};
+} // namespace
+
 // -----------------------------------------------------------------------------
 // The pass
 // -----------------------------------------------------------------------------
@@ -4097,6 +4170,8 @@ public:
     patterns.add<ConvertAtenIndexSelectOp>(typeConverter, context);
     patterns.add<ConvertAtenScalarToTensorLike>(typeConverter, context);
     target.addIllegalOp<AtenTensorIntOp, AtenTensorFloatOp>();
+    target.addIllegalOp<AtenIndexTensorOp>();
+    patterns.add<ConvertAtenIndexTensorOp>(typeConverter, context);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
